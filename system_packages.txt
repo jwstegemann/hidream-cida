@@ -1,0 +1,12 @@
+git
+git-lfs
+wget
+ca-certificates
+build-essential
+libgl1
+libglib2.0-0
+libsm6
+libxext6
+libxrender-dev
+ffmpeg
+

@@ -1,0 +1,15 @@
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["ComfyUI"]
+
+[tool.ruff]
+exclude = [".venv", "venv", "__pycache__"]
+line-length = 88
+# TODO: Add when available: "E266", "E203"
+lint.ignore = ["E501", "E741", "E402"]
+lint.select = ['E', 'F', 'W', 'I']
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-third-party = ["modal"]
