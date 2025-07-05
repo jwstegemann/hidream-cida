@@ -2,9 +2,10 @@
 venvPath = "."
 venv = ".venv"
 extraPaths = ["ComfyUI"]
+exclude = ["backup"]
 
 [tool.ruff]
-exclude = [".venv", "venv", "__pycache__"]
+exclude = [".venv", "venv", "__pycache__", "backup"]
 line-length = 88
 # TODO: Add when available: "E266", "E203"
 lint.ignore = ["E501", "E741", "E402"]

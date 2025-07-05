@@ -1,0 +1,164 @@
+# -*- coding: utf-8 -*-
+"""
+HiDream Identity Training Pipeline · **336 px / ViT‑L/14 Edition**
+================================================================
+Änderungen gegenüber der 224‑px‑Variante
+---------------------------------------
+1. **Backbone**: OpenCLIP *ViT‑L/14* (Patch 14) → Token‑Dim = 1024.
+2. **Input‑Größe**: Bilder werden auf **336 × 336 px** skaliert.
+3. **MLP‑Projektor**: 1024→4096 (LLama‑Hidden).
+4. **Speicher**: ViT‑L & 32×24 = 768 Tokens – benötigt ~7 GB bei FP16; Batch‑Größe
+   default‑weise reduziert.
+
+Aufrufbeispiel
+```bash
+python train_hidream_identity.py contrastive \
+       --data_root /data/training/real \
+       --output_dir ckpts/vitL_contrastive \
+       --batch_size 16   # statt 32
+```
+"""
+
+import argparse
+import logging
+from pathlib import Path
+from typing import List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets.folder import default_loader
+from torchvision.utils import save_image
+
+from accelerate import Accelerator
+from diffusers import HiDreamPipeline
+from safetensors.torch import save_file as save_safetensors
+from tqdm.auto import tqdm
+from transformers import CLIPProcessor, CLIPModel
+
+# ---------------------------------------------------------------------------
+# 1)  Identity Encoder  (ViT‑L/14 336 px)
+# ---------------------------------------------------------------------------
+class IdentityNet(nn.Module):
+    """OpenCLIP ViT‑L/14 visual → 16 identity tokens (4096‑dim)."""
+
+    def __init__(self, num_tokens: int = 16):
+        super().__init__()
+        from open_clip import create_model_from_pretrained
+
+        self.vit = create_model_from_pretrained("ViT-L-14", "openai").visual
+        self.resize = transforms.Resize((336, 336))
+        self.norm   = transforms.Normalize([0.5]*3, [0.5]*3)
+        self.num_tokens = num_tokens
+        self.proj = nn.Sequential(
+            nn.Linear(1024, 4096), nn.GELU(), nn.Linear(4096, 4096)
+        )
+
+    @torch.no_grad()
+    def _pre(self, x):
+        return self.norm(self.resize(x))
+
+    def forward(self, imgs: torch.Tensor):  # (B,3,≤H,≤W)
+        imgs = self._pre(imgs)
+        feats = self.vit(imgs, return_all_tokens=True)  # (B, tokens, 1024)
+        cls = feats[:, 0]                   # CLS‑Token
+        tok = self.proj(cls)               # (B,4096)
+        return tok.unsqueeze(1).repeat(1, self.num_tokens, 1)
+
+
+class PerceiverResampler(nn.Module):
+    def __init__(self, token_dim: int = 4096, num_latents: int = 16):
+        super().__init__()
+        self.latents = nn.Parameter(torch.randn(num_latents, token_dim))
+        self.cross = nn.MultiheadAttention(token_dim, 8, batch_first=True)
+
+    def forward(self, t):
+        B = t.size(0)
+        lat = self.latents.unsqueeze(0).repeat(B,1,1)
+        out,_ = self.cross(lat, t, t)
+        return out
+
+class IdentityEmbedder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.idnet = IdentityNet()
+        self.resampler = PerceiverResampler()
+
+    def forward(self, imgs):
+        return self.resampler(self.idnet(imgs))
+
+# ---------------------------------------------------------------------------
+# 2)  Dataset + Loss (unverändert, außer Resize)
+# ---------------------------------------------------------------------------
+class FacePairDataset(torch.utils.data.Dataset):
+    def __init__(self, root:str):
+        self.samples: List[Tuple[str,int]]=[]
+        for person in sorted(Path(root).iterdir()):
+            if not person.is_dir():
+                continue
+            for img in person.glob("*.jpg"):
+                self.samples.append((str(img), hash(person.name)))
+        self.tf = transforms.Compose([
+            transforms.Resize((336,336)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5]*3,[0.5]*3),
+        ])
+    def __len__(self): return len(self.samples)
+    def __getitem__(self,i):
+        p,l = self.samples[i]
+        return self.tf(default_loader(p)), l
+
+class NTXentLoss(nn.Module):
+    def __init__(self,t=0.1):
+        super().__init__();self.t=t
+    def forward(self,z1,z2):
+        B=z1.size(0)
+        z1,z2=F.normalize(z1,dim=-1),F.normalize(z2,dim=-1)
+        sims=torch.cat([z1,z2])@torch.cat([z1,z2]).T/self.t
+        lbl=torch.arange(B,device=z1.device).repeat(2)
+        sims.fill_diagonal_(-9e15)
+        return F.cross_entropy(sims,lbl)
+
+# ---------------------------------------------------------------------------
+# 3)  Training‑Loops (nur Contrastive gezeigt; Distill analog anpassen)
+# ---------------------------------------------------------------------------
+
+def train_contrastive(args):
+    acc=Accelerator()
+    dl=DataLoader(FacePairDataset(args.data_root),batch_size=args.batch_size,shuffle=True,num_workers=4)
+    embed=IdentityEmbedder(); opt=torch.optim.AdamW(embed.parameters(),1e-4)
+    loss_fn=NTXentLoss(); embed,opt,dl=acc.prepare(embed,opt,dl)
+
+    for ep in range(args.epochs):
+        embed.train(); running=0.0
+        for x,_ in tqdm(dl,disable=not acc.is_local_main_process):
+            tok=embed(x).mean(1)
+            # Simple positive/negative via random shuffle
+            tok_sh = torch.roll(tok,1,0)
+            loss=loss_fn(tok,tok_sh)
+            acc.backward(loss); opt.step(); opt.zero_grad()
+            running+=loss.item()
+        if acc.is_main_process and (ep+1)%args.save_every==0:
+            save_safetensors(embed.state_dict(), Path(args.out)/f"epoch_{ep:03d}.safetensors")
+            logging.info(f"ep{ep}: loss={running/len(dl):.4f}")
+
+# ---------------------------------------------------------------------------
+# 4)  CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    logging.basicConfig(level=logging.INFO)
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--data_root",required=True)
+    ap.add_argument("--out",required=True)
+    ap.add_argument("--epochs",type=int,default=6)
+    ap.add_argument("--batch_size",type=int,default=16)
+    ap.add_argument("--save_every",type=int,default=2)
+    args=ap.parse_args()
+    Path(args.out).mkdir(parents=True,exist_ok=True)
+    train_contrastive(args)
+
+if __name__=="__main__":
+    main()

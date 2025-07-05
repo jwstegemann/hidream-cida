@@ -1,0 +1,264 @@
+# -*- coding: utf-8 -*-
+"""
+modal_faces_vgg_casia.py  ·  v3  (Kaggle Mirror Edition)
+======================================================
+Lädt **VGGFace2** & **CASIA‑WebFace** von den stabilen Kaggle‑Spiegeln, weil
+HF‑URLs/ Oxford‑Server nicht mehr erreichbar sind.
+
+* Braucht das *Kaggle CLI* → API Token als Modal‑Secret `kaggle` hinterlegen.
+
+  ```bash
+  modal secret set kaggle KAGGLE_USERNAME=<name> KAGGLE_KEY=<key>
+  ```
+
+* Ergebnis‑Layout:  `DATA_DIR/training/real/{vggface2|casia}/<person_id>/<img>.jpg`
+* `--limit N` kann die Gesamtzahl zufällig einkürzen (Speicher sparen).
+
+---
+**Aufrufbeispiel**
+```bash
+modal run modal_faces_vgg_casia.py::download_faces \
+       --vgg --casia --limit 200000
+```
+"""
+
+from __future__ import annotations
+
+import csv
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from multiprocessing.pool import ThreadPool
+from pathlib import Path
+
+import modal
+
+
+class UnionFind:
+    """Simple Union-Find (Disjoint Set Union) implementation."""
+    def __init__(self):
+        self.parent: dict[str, str] = {}
+        self.rank:   dict[str, int] = {}
+
+    def find(self, x: str) -> str:
+        """Find root with path compression."""
+        if self.parent.get(x, x) != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent.get(x, x)
+
+    def union(self, x: str, y: str) -> None:
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return
+        # union by rank
+        if self.rank.get(rx, 0) < self.rank.get(ry, 0):
+            rx, ry = ry, rx
+        self.parent[ry] = rx
+        self.rank[rx]  = max(self.rank.get(rx, 0), self.rank.get(ry, 0) + 1)
+
+    def add(self, x: str) -> None:
+        if x not in self.parent:
+            self.parent[x] = x
+            self.rank[x] = 0
+
+
+def build_groups(csv_path: Path) -> dict[str, list[str]]:
+    """
+    Build connected components using only the positive (label==1) pairs.
+    Returns: {root_id: [member filenames]}
+    """
+    uf = UnionFind()
+
+    # First pass – collect names & union positives
+    with csv_path.open(newline='', encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 3:
+                raise ValueError(f"CSV row has fewer than 3 columns: {row}")
+            a, b, lbl = row[0].strip(), row[1].strip(), row[2].strip()
+            # Register images
+            uf.add(a)
+            uf.add(b)
+            # Union positives
+            if lbl == "1":
+                uf.union(a, b)
+
+    # Second pass – bucket images by their root
+    groups: dict[str, list[str]] = defaultdict(list)
+    for img in uf.parent.keys():
+        root = uf.find(img)
+        groups[root].append(img)
+    return groups
+
+# ─────────────────────────── Config ──
+APP_NAME = "cida-download-people"
+HF_CACHE = Path("/models")      # shared HF cache
+DATA_DIR = Path("/data")        # user dataset mount
+
+# ─────────────────────────── Modal app ──
+app = modal.App(APP_NAME)
+
+# Volumes
+hf_cache_vol = modal.Volume.from_name("cida-hf-cache", create_if_missing=True)
+dataset_vgg_casia_vol = modal.Volume.from_name("dataset-vgg-casia", create_if_missing=True) # beibehalten
+dataset_celeba_vol = modal.Volume.from_name("dataset-celeba", create_if_missing=True) # beibehalten
+dataset_tmp_vol = modal.Volume.from_name("dataset-tmp", create_if_missing=True) # beibehalten
+
+VGG_CASIA = DATA_DIR / "vgg_casia"
+CELEBA = DATA_DIR / "celeba"
+TMP = DATA_DIR / "tmp"
+
+app = modal.App(APP_NAME)
+
+# ---------------------------------------------------------------------------
+# Paralleles Kopieren (wie gehabt)
+# ---------------------------------------------------------------------------
+
+def copy_concurrent(src: Path, dest: Path, threads: int = 24):
+    class Copier:
+        def __init__(self, n):
+            self.pool = ThreadPool(n)
+            self.jobs = []
+
+        def _copy(self, s, d):
+            self.jobs.append(
+                self.pool.apply_async(
+                    shutil.copy2,
+                    args=(s, d),
+                    error_callback=lambda e: print(f"copy error: {e}", file=sys.stderr),
+                )
+            )
+
+        def close(self):
+            self.pool.close()
+            self.pool.join()
+
+    cp = Copier(threads)
+    shutil.copytree(src, dest, copy_function=cp._copy, dirs_exist_ok=True)
+    cp.close()
+
+
+def prepare_face_vae(TMP, OUT):
+    """
+    Lädt das Kaggle-Dataset 'kushsheth/face-vae' herunter,
+    entpackt es und verteilt alle Bilder nach Personen­-IDs
+    unter /data/training/real/<id>/.
+    """
+    tmp = Path(f"{TMP}/face_vae")
+    tmp.mkdir(parents=True, exist_ok=True)
+
+    print(str(tmp))
+
+    #1. Download & Entpacken
+    # subprocess.run(
+    #    ["kaggle", "datasets", "download", "-d", "kushsheth/face-vae",
+    #     "-p", str(tmp), "--unzip"],
+    #    check=True,
+    # )
+
+    images_dir = tmp / "img_align_celeba" / "img_align_celeba"
+    csv_file   = tmp / "training.csv"
+    output_dir = CELEBA
+
+    if not images_dir.is_dir():
+        raise FileNotFoundError(f"Images directory not found: {images_dir}")
+    if not csv_file.is_file():
+        raise FileNotFoundError(f"CSV file not found: {csv_file}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    groups = build_groups(csv_file)
+
+    # Assign a stable, deterministic number to each group
+    # (sort by smallest image filename in the group)
+    sorted_roots = sorted(groups.keys(), key=lambda r: min(groups[r]))
+    root_to_idx = {root: idx for idx, root in enumerate(sorted_roots)}
+
+    for root, images in groups.items():
+        idx = root_to_idx[root]
+        target_subdir = output_dir / ("f_" + str(idx))
+        target_subdir.mkdir(parents=True, exist_ok=True)
+
+        from tqdm import tqdm
+
+        for img_name in tqdm(
+                images,
+                total=len(images),            # lets tqdm compute % complete
+                desc=f"dir {idx}",            # label shows which person-folder we’re filling
+                unit="img",
+                leave=False                   # keep outer progress bars clean; drop if you prefer persistent bars
+            ):
+            src = images_dir / img_name
+            if not src.is_file():
+                print(f"WARNING: source image not found: {src}")
+                continue
+            dst = target_subdir / img_name
+            shutil.copy2(src, dst)
+
+    print(f"Finished! Created {len(groups)} directories in {output_dir}")
+
+    print("✅ face-vae ist einsortiert!")
+
+# ---------------------------------------------------------------------------
+# Modal Function
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=(
+        modal.Image.debian_slim()
+        .apt_install("unzip")
+        .pip_install("tqdm", "kaggle")
+        .env({"KAGGLE_CONFIG_DIR": "/root/.kaggle"})
+    ),
+    secrets=[modal.Secret.from_name("kaggle")],
+    volumes={str(TMP): dataset_tmp_vol, str(VGG_CASIA): dataset_vgg_casia_vol, str(CELEBA): dataset_celeba_vol},
+    timeout=7200,
+)
+def download_faces(vgg: bool = False, casia: bool = True, celeb: bool = True, limit: int | None = None):
+    """Download & Entpacken von VGGFace2 / CASIA‑WebFace via Kaggle."""
+
+    TMP.mkdir(parents=True, exist_ok=True)
+    OUT = VGG_CASIA
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    def kaggle_unzip(dataset: str, dst: Path):
+        dst.mkdir(parents=True, exist_ok=True)
+        print(f"⏬ Kaggle › {dataset} …")
+        subprocess.run([
+            "kaggle", "datasets", "download", "-d", dataset, "-p", str(dst), "--unzip"
+        ], check=True)
+
+    # ---------- VGGFace2 ----------
+    if vgg:
+        kaggle_unzip("hearfool/vggface2", TMP / "vgg")
+        splits = [TMP / "vgg" / "train", TMP / "vgg" / "test"]
+        for split_dir in splits:
+            if not split_dir.exists():
+                continue
+            for pid_dir in split_dir.iterdir():  # id00012, id00013 …
+                if pid_dir.is_dir():
+                    dest = OUT / f"v_{pid_dir.name}"
+                    copy_concurrent(pid_dir, dest)
+        print("✅ VGGFace2 → IDs direkt unter", OUT)
+
+    if celeb:
+        prepare_face_vae(TMP, OUT)
+
+    # ---------- CASIA‑WebFace ----------
+    if casia:
+        kaggle_unzip("ntl0601/casia-webface", TMP / "casia_zip")
+        root_casia = next((TMP / "casia_zip").iterdir())  # "casia-webface" folder
+        for pid_dir in root_casia.iterdir():
+            if pid_dir.is_dir():
+                dest = OUT / f"c_{pid_dir.name}"
+                copy_concurrent(pid_dir, dest)
+        print("✅ CASIA‑WebFace → IDs direkt unter", OUT)
+
+    # ---------- Optionales Limit ----------‑WebFace ----------‑WebFace ----------
+    if casia:
+        kaggle_unzip("ntl0601/casia-webface", TMP / "casia")
+        inner = next((TMP / "casia").iterdir())  # erster Unterordner
+        copy_concurrent(inner, OUT / "casia")
+        print("✅ CASIA‑WebFace fertig →", OUT / "casia")
+
+    print("🏁 Download abgeschlossen →", OUT)

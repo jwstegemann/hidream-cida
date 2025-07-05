@@ -1,0 +1,86 @@
+
+import os
+from pathlib import Path
+
+import modal
+
+# ─────────────────────────── Config ──
+APP_NAME = "cida-training"
+PORT = 7860
+HF_CACHE = Path("/models")      # shared HF cache
+DATA_DIR = Path("/data")        # user dataset mount
+
+app = modal.App(APP_NAME)
+
+# Volumes
+hf_cache_vol = modal.Volume.from_name("cida-hf-cache", create_if_missing=True)
+data_vol = modal.Volume.from_name("cida-data", create_if_missing=True)
+
+# Secret
+HF_SECRET = modal.Secret.from_name("huggingface")
+HF_CACHE = Path("/models")      # shared HF cache
+DATA_DIR = Path("/data")
+EXTRA_INDEX_URL = "https://download.pytorch.org/whl/cu121"
+
+
+# Container image
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install(
+        "git",
+        "git-lfs",
+        "wget",
+        "ca-certificates",
+        "build-essential",
+        "libgl1",
+        "libglib2.0-0",
+        "libsm6",
+        "libxext6",
+        "libxrender-dev",
+        "ffmpeg",# base utilities
+    )
+    .pip_install(
+        "torch==2.4.0",
+        "torchvision==0.19.0",
+        "torchaudio==2.4.0",
+        extra_index_url=EXTRA_INDEX_URL,
+    )
+    .pip_install_from_requirements(
+        "./requirements.txt",
+        extra_index_url=EXTRA_INDEX_URL
+    )
+    .env(
+        {
+            "PYTHONUNBUFFERED": "1",
+            "HF_HUB_ENABLE_HF_TRANSFER": "1",
+            "TF_CPP_MIN_LOG_LEVEL": "2",   # suppress TF INFO logs
+            "INSIGHTFACE_HOME": f"{HF_CACHE}/.insightface"
+        }
+    )
+)
+
+
+
+# ---------------------------------------------------------------------------
+# 4) Training Loop
+# ---------------------------------------------------------------------------
+
+@app.function(
+    image=image,
+    secrets=[HF_SECRET],
+    volumes={str(HF_CACHE): hf_cache_vol, str(DATA_DIR): data_vol},
+    gpu="L40S",
+    timeout=60 * 60,
+)
+def train(args):
+   ap = argparse.ArgumentParser()
+   ap.add_argument("--epochs", type=int, default=8)
+   ap.add_argument("--steps_per_epoch", type=int, default=500)
+   ap.add_argument("--P", type=int, default=8)
+   ap.add_argument("--K", type=int, default=4)
+   ap.add_argument("--save_every", type=int, default=2)
+   ap.add_argument("--batch_size", type=int, default=8, help="kept for API compat; overridden by P×K")
+   args = ap.parse_args()
+   Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+   ...

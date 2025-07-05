@@ -1,0 +1,152 @@
+# modal_laion_face_full.py
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import modal
+
+from .generate_style_pool import APP_NAME, DATA_DIR, data_vol
+
+app = modal.App(APP_NAME)
+
+def copy_concurrent(src: Path, dest: Path) -> None:
+    """
+    A modified shutil.copytree which copies in parallel to increase bandwidth
+    and compensate for the increased IO latency of volume mounts.
+    """
+    from multiprocessing.pool import ThreadPool
+
+    class MultithreadedCopier:
+        def __init__(self, max_threads):
+            self.pool = ThreadPool(max_threads)
+            self.copy_jobs = []
+
+        def copy(self, source, dest):
+            res = self.pool.apply_async(
+                shutil.copy2,
+                args=(source, dest),
+                callback=lambda r: print(f"{source} copied to {dest}"),
+                # NOTE: this should `raise` an exception for proper reliability.
+                error_callback=lambda exc: print(
+                    f"{source} failed: {exc}", file=sys.stderr
+                ),
+            )
+            self.copy_jobs.append(res)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self.pool.close()
+            self.pool.join()
+
+    with MultithreadedCopier(max_threads=24) as copier:
+        shutil.copytree(src, dest, copy_function=copier.copy, dirs_exist_ok=True)
+
+@app.function(
+    image=modal.Image.debian_slim()
+    .pip_install(
+        "torch",
+        "img2dataset==1.45.0",
+        "pyarrow",  # für Parquet
+        "wget",
+    )
+    .apt_install("wget")
+    .env({
+        "TMPDIR": "/data/tmp",
+        "NO_ALBUMENTATIONS_UPDATE": "1"
+    }),
+    volumes={str(DATA_DIR): data_vol},
+    timeout = 3600
+)
+def download():
+    """
+    Führt Schritte 1–4 automatisch aus:
+     1) Metadata-Parquet herunterladen
+     2) Face ID Liste & converter laden
+     3) Face-Parquet erstellen
+     4) Bilder downloaden flach ins output-Verzeichnis
+    """
+    parquet_url_base="https://the-eye.eu/public/AI/cah/laion400m-met-release/laion400m-meta/"
+    face_ids_url="https://huggingface.co/datasets/FacePerceiver/laion-face/resolve/main/laion_face_ids.pth"
+    converter_url="https://raw.githubusercontent.com/FacePerceiver/LAION-Face/master/convert_parquet.py"
+    meta_dir: str =str(DATA_DIR / "laion_face_meta")
+    output_dir=str(DATA_DIR / "training/real")
+    num_images=50,
+    num_workers=16,
+    shard_start=0,
+    shard_end=1,
+
+    meta_path = Path(meta_dir)
+    # if meta_path.exists():
+    #     shutil.rmtree(meta_path)
+    meta_path.mkdir(parents=True, exist_ok=True)
+
+    tmp_path = Path("/data/tmp")
+    tmp_path.mkdir(exist_ok=True)
+
+    # 1) Metadata-Parquet herunterladen (rekursiv)
+    subprocess.run([
+        "wget", "--show-progress", "-P", meta_dir, "-q", "-l1", "-r", "-nd","-c", "-nc", "--no-parent",
+        f"{parquet_url_base}" + "part-00000-5b54c5d5-bbcf-484d-a2ce-0d6f73df1a36-c000.snappy.parquet"
+    ], check=True)
+    print("✅ Schritte 1 abgeschlossen: Parquet-Metadaten geholt.")
+
+    # 2) FacePerceiver ID Liste & converter
+    subprocess.run(["wget", "--show-progress", "-c", "-nc", "-P", meta_dir, "-q", face_ids_url], check=True)
+    subprocess.run(["wget", "--show-progress", "-c", "-nc", "-P", meta_dir, "-q", converter_url], check=True)
+    print("✅ Schritte 2 abgeschlossen: Face ID & converter geholt.")
+
+    #3) Face-only Parquet bauen
+    # subprocess.run([
+    #     "python3", "convert_parquet.py",
+    #     meta_dir + "/" + Path(face_ids_url).name,
+    #     meta_dir,
+    #     meta_dir + "/face_only_parquet"
+    # ], check=True, cwd=meta_dir)
+    print("✅ Schritt 3 abgeschlossen: Face-only Parquet erstellt.")
+
+    # 3.5) Kleines Parquet bauen
+    small_dir = Path(meta_dir) / "face_only_parquet" / "small"
+    small_dir.mkdir(parents=True, exist_ok=True)
+    import pandas as pd
+    df = pd.read_parquet("/data/laion_face_meta/face_only_parquet/laion_face_part_00000.parquet")
+    df.sample(50, random_state=42).to_parquet("/data/laion_face_meta/face_only_parquet/small/sample.parquet")
+    print("✅ Schritt 3.5 abgeschlossen: Face-only Parquet erstellt.")
+
+    # 4) Bilder herunterladen
+    out = Path(output_dir)
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    import os
+    print("CWD:", os.getcwd())
+    print("TMPDIR:", os.environ.get("TMPDIR"))
+    print("Contents of /data:", os.listdir("/data"))
+    print("out:", out)
+
+    print("🔽 Starte Bild-Download...")
+
+    from img2dataset import download
+    download(
+        url_list= meta_dir + "/face_only_parquet/small/sample.parquet", # "/data/laion_face_meta/laion_face_part_00000.parquet",
+        input_format="parquet",
+        url_col="URL",
+        output_folder="/training_tmp/real",
+        output_format="files",
+        processes_count=1,
+        thread_count=16,
+        image_size=None,
+        save_additional_columns=[],
+        resize_mode="no",        # or a number like 256
+        number_sample_per_shard=10000000,  # limits images per shard
+        enable_wandb=False,
+    )
+
+    print("🔽 Starte Kopieren...")
+
+    copy_concurrent(Path("/training_tmp/real"), Path("/data/training/real"))
+
+    print("✅ Schritt 4 abgeschlossen: Bilder sind im Zielordner.")
